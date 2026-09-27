@@ -1,0 +1,197 @@
+# ============================================================
+# summer-checkin —— 镜像构建流水线
+#
+# 这个文件必须放在仓库的 .github/workflows/build-image.yml 才会被 GitHub 识别。
+# 本地这份 web_blog/summer-checkin/deploy/build-image.yml 是**工作草稿**：
+# 改这里 → 推到 fork → Actions 跑。两边不一致时以推上去的那次 commit 为准。
+#
+# 【它解决什么问题】
+# 1. 你那台 1.8G 的机器不能自己 build：npm ci 装 1266 个包 + next build
+#    会把内存打满（而且和 PG 同机，OOM 可能连数据库一起杀）。
+# 2. 机器直接拉 Docker Hub 拉不通：这台机的 DNS 把 registry-1.docker.io
+#    解析到过段 IP（实测 connection refused），加速器只能救一部分仓库。
+# 所以：GitHub Actions（海外、16G、不限分钟数内）负责 build 和"搬运"，
+#      机器只从阿里云 ACR 内网拉——拉镜像这件事从此和公网质量无关。
+#
+# 【三个任务，各干什么】
+#   app-image    : 用仓库里的 Dockerfile 构建应用镜像 → 推 ACR
+#   mirror-base  : 把 pgvector/pg16 和 nginx:alpine 原样搬进 ACR（中转）
+#   （数据库镜像不"构建"，只搬——这是它和应用镜像最大的区别）
+#
+# 【需要你在 GitHub 仓库 Settings → Secrets and variables → Actions 里建 2 个】
+#   ACR_USERNAME   镜像仓库登录名（＝阿里云账号全名）。ACR 控制台任意仓库详情页
+#                  "操作指南 1. 登录阿里云 Container Registry" 那行
+#                  docker login --username=<这里> 抄下来就是它
+#   ACR_PASSWORD   你在 ACR「访问凭证」里设的那个固定密码
+#   就这两个。registry 域名和命名空间已经直接写在下面的 env 里了，理由见那里。
+#   ⚠️ 密码只进 Secrets，不进聊天记录、不进 git。
+#
+# 【域名坑】ACR 个人版有两套写法，别混（新版是 .cn-hangzhou. 点号写法）：
+#   新版实例： crpi-xxxx.cn-hangzhou.personal.cr.aliyuncs.com        （公网）
+#              crpi-xxxx-vpc.cn-hangzhou.personal.cr.aliyuncs.com   （VPC 内网，只在同 VPC 的机器上解析得到）
+#   旧版实例： registry.cn-hangzhou.aliyuncs.com                     （公网）
+#              registry-vpc.cn-hangzhou.aliyuncs.com                 （VPC）
+#   CI 这边**只能用公网域名**（GitHub 的机器不在你的 VPC 里）。
+#   -vpc 那个只属于同一个 VPC 内的 ECS。⚠️ 已确认你这台是**轻量应用服务器**
+#   （2026-09-27 阿里云控制台「我的资源」：轻量应用服务器 1 实例 / 5 防火墙规则，没有 ECS），
+#   轻量默认不进 VPC 内网 → 所以本流水线和你服务器上拉取**都用公网域名**，一个域名走两边。
+#   判断依据很简单：服务器上 curl 一下 -vpc 域名的 /v2/，能返回 401 才说明内网通。
+#
+# 【第一次跑最可能报的错，先记下来省得查】
+#   denied: requested access to the resource is denied
+#     → ACR_PASSWORD / ACR_USERNAME 不对（个人版不支持临时 token，只能固定密码）。
+#       这是最常见的原因，先怀疑它。
+#     → 仓库不存在。你的命名空间「自动创建仓库」已确认是**开启**（2026-09-27 控制台核实），
+#       所以 summer-checkin-app / pgvector-pg16 / nginx-alpine 三个仓库第一次 push 会自动建，
+#       不需要手动建。若仍报 denied，去控制台看命名空间有没有被改回关闭。
+#   TOOMANYREQUESTS
+#     → 个人版官方限制：并发拉取要控制在 10 以下，频繁推拉会限流。
+#       本流水线一次只推三个镜像、且 concurrency 串行，正常碰不到。
+#
+# 【和 ACR「代码变更自动构建镜像」的关系 —— 已核实，别重复担心】
+#   ACR 控制台那个仓库的「构建」页显示：代码变更自动构建镜像 = 开启，
+#   但规则里只有**一条内置规则** `tags: release-v$version`，且构建日志「没有数据」。
+#   意思是：它只在打 `release-v*` 这样的 tag 时才构建，你 push 到 master **不会**触发 ACR 构建。
+#   所以不存在"Actions 和 ACR 各建一次、互相覆盖"的问题，不用去关它。
+# ============================================================
+
+name: 构建镜像并推送到阿里云 ACR
+
+on:
+  # 只有默认分支的 push 才触发，避免你开一堆分支就烧一堆构建分钟。
+  # ⚠️ 这个 fork 的默认分支是 **master**，不是 main（已用 GitHub API 核过：
+  #    唯一分支 master = f61186d）。写成 main 的话这条流水线会**永远不触发**，
+  #    而且不报错——你会以为"CI 坏了"，实际是它压根没被叫起来。
+  #    上游如果哪天改名或你 fork 到别的仓库，先 `git branch` 看一眼再改这里。
+  push:
+    branches: [master]
+  # 手动触发：Actions 页面 → 左侧这条流水线 → Run workflow
+  # 第一次跑、或者只想重搬基础镜像时用这个
+  workflow_dispatch:
+    inputs:
+      skip_app:
+        description: "只搬基础镜像，跳过应用构建（勾选则不 build app）"
+        type: boolean
+        default: false
+
+# 同一条流水线不并发跑：ACR 有限流，而且并发推同名 tag 会互相覆盖
+concurrency:
+  group: build-image-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # 【为什么这两个直接写死、不放 Secrets】
+  # Secrets 是给"泄露了要改密码"的东西用的。registry 域名和命名空间**天生是公开的**：
+  # 任何人 docker pull 都需要它俩，它们会出现在每一条拉取命令里。把它们塞进 Secrets
+  # 只会让配置文件读起来像打码文件，不提供任何安全性。
+  # 真正进 Secrets 的只有两个：用户名（它是你的阿里云账号标识，不该出现在公开仓库里）
+  # 和密码。这条界线本身就是这次要练的东西。
+  REGISTRY: crpi-898764hxzvvou0jj.cn-hangzhou.personal.cr.aliyuncs.com
+  NAMESPACE: 250827_test
+  APP_IMAGE: summer-checkin-app
+  PG_IMAGE: pgvector-pg16
+  NGINX_IMAGE: nginx-alpine
+
+jobs:
+  # ─────────────────────────────────────────────
+  # 任务 1：构建应用镜像
+  # ─────────────────────────────────────────────
+  app-image:
+    if: ${{ !inputs.skip_app }}          # 手动触发时可以跳过；push 时 inputs 为空 → 恒 true
+    runs-on: ubuntu-latest
+    timeout-minutes: 40                   # 上游 npm ci 很慢，给足；超了会 fail 而不是永远转圈
+    steps:
+      - name: 拉取代码
+        uses: actions/checkout@v4
+
+      # ------------------------------------------------------------------
+      # 这一步是这条流水线里唯一"看起来多余但很重要"的地方。
+      # 上游 ci.yml 的作者已经在注释里踩过：prisma.config.ts 在没有
+      # DATABASE_URL 时会直接报错退出。Dockerfile 里用的是占位值
+      # （mysql://dummy...），但 buildx 默认不会把宿主机的 env 传进容器，
+      # 所以我们显式声明为 build-arg —— 见下面 with.build-args。
+      # ------------------------------------------------------------------
+      - name: 设置 buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: 登录 ACR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+
+      # 给镜像算两个 tag：<git短sha> 和 latest。
+      # 短 sha 那个是"可回滚的锚点"（和简历站 deploy.sh 的 releases/<sha> 同一个思路），
+      # latest 只是让你服务器上不用每次改 compose 里的版本号。
+      - name: 计算标签
+        id: meta
+        run: |
+          echo "sha=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          echo "app=${REGISTRY}/${NAMESPACE}/${APP_IMAGE}" >> "$GITHUB_OUTPUT"
+
+      - name: 构建并推送
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ steps.meta.outputs.app }}:${{ steps.meta.outputs.sha }}
+            ${{ steps.meta.outputs.app }}:latest
+          # Prisma 引擎下载走 npmmirror 已经在 Dockerfile 里配了；
+          # 这里只加一层 BuildKit 缓存，命中时能省掉 npm ci 的几分钟。
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # 把这一行的输出留在 job summary 里，Actions 页面直接能复制镜像地址，
+      # 不用去 ACR 控制台翻——这是给"下次忘了镜像叫啥"准备的。
+      - name: 记录产物地址
+        run: |
+          {
+            echo "## 应用镜像已推送"
+            echo ""
+            echo '```'
+            echo "${{ steps.meta.outputs.app }}:${{ steps.meta.outputs.sha }}"
+            echo "${{ steps.meta.outputs.app }}:latest"
+            echo '```'
+            echo ""
+            echo "服务器 docker pull 直接用上面这个公网域名即可。"
+            echo "（这台是轻量应用服务器，不在 VPC 里，-vpc 域名解析不到。"
+            echo " 想自己验证一次：在服务器上 curl 该域名的 /v2/ 路径，返回 401 就是通的。）"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ─────────────────────────────────────────────
+  # 任务 2：把两个基础镜像搬进 ACR（中转）
+  #
+  # 为什么单独一个任务而不是写进 Dockerfile：
+  # pgvector 和 nginx 不是我们构建出来的，是别人发布好的。
+  # 服务器拉不动 Docker Hub，那就让 CI（能拉动的地方）拉下来、改个名、
+  # 推到离服务器近的 ACR。这叫"镜像搬运/离线镜像分发"，
+  # 企业内网落地时是完全一样的手法，不是变通方案。
+  # ─────────────────────────────────────────────
+  mirror-base:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: 登录 ACR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+
+      - name: 搬运 pgvector/pgvector:pg16
+        run: |
+          set -euo pipefail
+          docker pull pgvector/pgvector:pg16
+          docker tag  pgvector/pgvector:pg16 "${REGISTRY}/${NAMESPACE}/${PG_IMAGE}:pg16"
+          docker push "${REGISTRY}/${NAMESPACE}/${PG_IMAGE}:pg16"
+
+      - name: 搬运 nginx:alpine
+        run: |
+          set -euo pipefail
+          docker pull nginx:alpine
+          docker tag  nginx:alpine "${REGISTRY}/${NAMESPACE}/${NGINX_IMAGE}:alpine"
+          docker push "${REGISTRY}/${NAMESPACE}/${NGINX_IMAGE}:alpine"
+      # 说明：push 已存在的相同 layer 时 Docker 会跳过上传，所以第二次跑这个
+      # 任务几乎是秒级——不用为"每次 CI 都搬一遍"担心流量。
