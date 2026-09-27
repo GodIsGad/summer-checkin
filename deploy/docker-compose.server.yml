@@ -51,7 +51,9 @@ services:
       POSTGRES_USER: postgres
       # ":?" = 没在 .env 里配就直接拒绝启动并把这句话打给你看。
       # 比"悄悄用个默认弱密码"安全得多——这类 :- 默认值正是上游那份 compose 的问题之一。
-      POSTGRES_PASSWORD: ${POSTG…必须在 .env 里配，别用默认值}
+      # ⚠️ 报错文案必须用 ASCII：compose 的插值解析器对变量名之后那段的要求很严，
+      #    中文标点曾经把整行吃成 ${POSTG…} 这种非法变量名，直接 invalid interpolation。
+      POSTGRES_PASSWORD: ${POSTG…POSTGRES_PASSWORD in .env}
       POSTGRES_DB: summer_checkin
     # 1.8G 的机器上 PG 只能当小弟：默认配置是按"独占一台大内存机"调的。
     # shared_buffers 128MB 足够自测；work_mem 小是因为排序/hash 是"每个连接每步"都算一份。
