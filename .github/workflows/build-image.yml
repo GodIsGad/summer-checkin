@@ -38,11 +38,24 @@
 #     vpc-id=vpc-bp1864...  → **这台是 VPC 内的 ECS，-vpc 走的是真内网**，服务器上拉它。
 #     （我先前根据控制台写的"这台是轻量应用服务器、-vpc 解析不到"是错的，已按实测改正。）
 #
-# 【第一次跑最可能报的错，先记下来省得查】
-#   denied: requested access to the resource is denied
+# 【第一次跑最可能报的错 —— 这三条都是真踩过的，看清"报在哪一步"再动手】
+#   unauthorized: authentication required   ← 报在「登录 ACR」
 #     → ACR_PASSWORD / ACR_USERNAME 不对（个人版不支持临时 token，只能固定密码）。
-#       这是最常见的原因，先怀疑它。
-#     → 仓库不存在。你的命名空间「自动创建仓库」已确认是**开启**（2026-09-27 控制台核实），
+#     ⚠️ 2026-09-27 实测：他在控制台重置了密码，Secrets 里还是旧的，
+#       症状就是这一步红、后面步骤全 skipped。
+#       正确顺序：先在服务器上 docker login 验通，再改 Secrets，别两边来回猜。
+#   denied: unknown manifest class for application/vnd.oci.empty.v1+json   ← 报在「构建并推送」
+#     → **长得像权限问题，其实不是**。这时用户名密码全对、登录早就过了、
+#       镜像也已经 build 完，是最后一步 push 被仓库拒。
+#       原因：buildx 默认给镜像附带 provenance/SBOM 证明，产物因此变成一个
+#       OCI image index，里面有一个 mediaType 为 application/vnd.oci.empty.v1+json
+#       的空配置描述符 —— ACR 的 registry 不认这种 manifest class，直接 denied。
+#       修法见下面 build-push-action 里的 provenance / sbom 两个 false（已加好）。
+#       这条经验值千金：**denied 这个词在 Registry 语境下一律先看它发生在哪一步**，
+#       它既可能是"你没资格"，也可能是"你这个东西我看不懂"。
+#   denied: requested access to the resource is denied   ← 这个才是真权限
+#     → 仓库不存在或命名空间「自动创建仓库」被关。
+#       你的命名空间实测是开启（2026-09-27 控制台核实），
 #       所以 summer-checkin-app / pgvector-pg16 / nginx-alpine 三个仓库第一次 push 会自动建，
 #       不需要手动建。若仍报 denied，去控制台看命名空间有没有被改回关闭。
 #   TOOMANYREQUESTS
@@ -139,6 +152,27 @@ jobs:
           tags: |
             ${{ steps.meta.outputs.app }}:${{ steps.meta.outputs.sha }}
             ${{ steps.meta.outputs.app }}:latest
+          # ------------------------------------------------------------
+          # ⚠️ 这两行是 ACR 个人版的硬要求，不是可选优化（2026-09-27 实测）。
+          # buildx 默认给每次构建附带 provenance（来源证明）和 SBOM（物料清单），
+          # 有了它们，推上去的就不是一个镜像，而是一个 **OCI image index**：
+          # 一条指向你的镜像，另几条指向证明，而证明那条的 config mediaType 是
+          # application/vnd.oci.empty.v1+json（一个"空占位"）。
+          # ACR 的 registry 不认识这种 manifest class → 直接 denied，
+          # 于是出现"登录成功、构建成功、最后一步 push 失败"这种很迷惑的现场。
+          #
+          # 旁证就在这份文件里：下面 mirror-base 任务用 docker pull/tag/push
+          # 搬 pgvector 和 nginx，一次就过 —— 因为 docker CLI 推的是传统
+          # Docker schema2 manifest，ACR 完全认得。同一个仓库、同一个账号，
+          # 差别只在"谁推的、推的是什么格式"。
+          #
+          # 关掉它的代价：镜像里没有来源证明和 SBOM。
+          # 企业里真要审供应链，正确做法是把 attestation 单独推到一个支持
+          # OCI artifact 的仓库（ACR 企业版 / Harbor 2.x+ / GHCR），
+          # 用 digest 关联回镜像 —— 而不是塞在应用镜像的 tag 里。
+          # ------------------------------------------------------------
+          provenance: false
+          sbom: false
           # Prisma 引擎下载走 npmmirror 已经在 Dockerfile 里配了；
           # 这里只加一层 BuildKit 缓存，命中时能省掉 npm ci 的几分钟。
           cache-from: type=gha
