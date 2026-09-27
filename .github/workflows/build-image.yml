@@ -32,10 +32,11 @@
 #   旧版实例： registry.cn-hangzhou.aliyuncs.com                     （公网）
 #              registry-vpc.cn-hangzhou.aliyuncs.com                 （VPC）
 #   CI 这边**只能用公网域名**（GitHub 的机器不在你的 VPC 里）。
-#   -vpc 那个只属于同一个 VPC 内的 ECS。⚠️ 已确认你这台是**轻量应用服务器**
-#   （2026-09-27 阿里云控制台「我的资源」：轻量应用服务器 1 实例 / 5 防火墙规则，没有 ECS），
-#   轻量默认不进 VPC 内网 → 所以本流水线和你服务器上拉取**都用公网域名**，一个域名走两边。
-#   判断依据很简单：服务器上 curl 一下 -vpc 域名的 /v2/，能返回 401 才说明内网通。
+#   -vpc 那个给服务器上 docker pull 用 —— 2026-09-27 在这台机器上实测过：
+#     公网域名解析到 120.55.105.209（公网 IP），-vpc 解析到 100.103.7.180（阿里云内网段），
+#     两个都是 401（= 连得上、只是要登录），且 meta-data 报 instance-id=i-bp145... 、
+#     vpc-id=vpc-bp1864...  → **这台是 VPC 内的 ECS，-vpc 走的是真内网**，服务器上拉它。
+#     （我先前根据控制台写的"这台是轻量应用服务器、-vpc 解析不到"是错的，已按实测改正。）
 #
 # 【第一次跑最可能报的错，先记下来省得查】
 #   denied: requested access to the resource is denied
@@ -155,9 +156,9 @@ jobs:
             echo "${{ steps.meta.outputs.app }}:latest"
             echo '```'
             echo ""
-            echo "服务器 docker pull 直接用上面这个公网域名即可。"
-            echo "（这台是轻量应用服务器，不在 VPC 里，-vpc 域名解析不到。"
-            echo " 想自己验证一次：在服务器上 curl 该域名的 /v2/ 路径，返回 401 就是通的。）"
+            echo "CI 推的是公网域名；服务器上 docker pull 请换 -vpc 版（同实例同地域，走内网不占公网带宽）："
+            echo "crpi-898764hxzvvou0jj-vpc.cn-hangzhou.personal.cr.aliyuncs.com/250827_test/summer-checkin-app"
+            echo "（已实测：这台是 VPC 内的 ECS，-vpc 解析到 100.103.7.180 内网地址且返回 401，通路成立。）"
           } >> "$GITHUB_STEP_SUMMARY"
 
   # ─────────────────────────────────────────────
