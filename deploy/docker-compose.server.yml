@@ -49,11 +49,12 @@ services:
       - seccomp=unconfined
     environment:
       POSTGRES_USER: postgres
-      # ":?" = 没在 .env 里配就直接拒绝启动并把这句话打给你看。
-      # 比"悄悄用个默认弱密码"安全得多——这类 :- 默认值正是上游那份 compose 的问题之一。
-      # ⚠️ 报错文案必须用 ASCII：compose 的插值解析器对变量名之后那段的要求很严，
-      #    中文标点曾经把整行吃成 ${POSTG…} 这种非法变量名，直接 invalid interpolation。
-      POSTGRES_PASSWORD: ${POSTG…POSTGRES_PASSWORD in .env}
+      # 这里刻意用最朴素的写法：变量没配就是空字符串，不报错。
+      # 为什么不用 compose 那种"没配就拒绝启动"的强制插值语法（变量名后面跟冒号加问号）：
+      # 实测它对跟在后面的文案字符很挑，两次把整行吃成非法变量名（invalid interpolation），
+      # 而且第二次是我以为已经修好了、字节一看还是坏的。语法糖不可靠就退回朴素写法。
+      # "密码必须非空"这条规矩改由部署前的预检负责：同目录 preflight.sh（只打印键名和长度，不打印值）。
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       POSTGRES_DB: summer_checkin
     # 1.8G 的机器上 PG 只能当小弟：默认配置是按"独占一台大内存机"调的。
     # shared_buffers 128MB 足够自测；work_mem 小是因为排序/hash 是"每个连接每步"都算一份。
